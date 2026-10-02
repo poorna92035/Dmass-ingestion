@@ -11,20 +11,18 @@ Required Files+++++++++++++++++++++++
 
 Flow :
 
-Validate
-   ↓
-Unit Tests
-   ↓
+Validate + Unit Test
+        ↓
 Build Connector Dependencies
-   ↓
-Build Docker Image (Dockerfile)
-   ↓
-Trivy Scan
-   ↓
-Push to ECR
-   ↓
-Package Lambda
-   ↓
+        ↓
+Docker Build
+        ↓
+SBOM + Prisma Scan
+        ↓
+Push Image To ECR
+        ↓
+Package Lambda Handlers
+        ↓
 Deploy ECS Service
-   ↓
+        ↓
 Smoke Test
