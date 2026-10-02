@@ -66,57 +66,92 @@ jobs:
           npm ci
           npm run build
 
-  docker-build-scan-push:
-    name: Build Docker Image / Scan / Push
-    runs-on: ubuntu-latest
-    needs: build-dependencies
+ docker-build-scan-push:
+  name: Build Docker Image / SBOM / Prisma Scan / Push
+  runs-on: ubuntu-latest
+  needs: build-dependencies
 
-    outputs:
-      image: ${{ steps.image.outputs.image }}
+  outputs:
+    image: ${{ steps.image.outputs.image }}
 
-    steps:
-      - uses: actions/checkout@v4
+  steps:
+    - name: Checkout Code
+      uses: actions/checkout@v4
 
-      - name: Configure AWS Credentials
-        uses: aws-actions/configure-aws-credentials@v4
-        with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
-          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-region: ${{ env.AWS_REGION }}
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
 
-      - name: Login to Amazon ECR
-        id: login-ecr
-        uses: aws-actions/amazon-ecr-login@v2
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build Docker Image from Dockerfile
-        run: |
-          docker build \
-            -f Dockerfile \
-            -t ${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
+    ###################################################################
+    # Build Image using Dockerfile
+    ###################################################################
+    - name: Build Docker Image
+      run: |
+        docker build \
+          -f Dockerfile \
+          -t connector:${{ github.sha }} .
 
-      - name: Scan Docker Image using Trivy
-        uses: aquasecurity/trivy-action@master
-        with:
-          image-ref: "${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
-          format: table
-          exit-code: 1
-          severity: CRITICAL,HIGH
+    ###################################################################
+    # Generate SBOM
+    ###################################################################
+    - name: Generate SBOM
+      uses: anchore/sbom-action@v0
+      with:
+        image: connector:${{ github.sha }}
+        format: spdx-json
+        output-file: sbom.spdx.json
 
-      - name: Tag Docker Image
-        run: |
-          docker tag \
-          ${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
-          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+    - name: Upload SBOM
+      uses: actions/upload-artifact@v4
+      with:
+        name: sbom-report
+        path: sbom.spdx.json
 
-      - name: Push Docker Image to ECR
-        run: |
-          docker push \
-          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+    ###################################################################
+    # Prisma Cloud / Twistlock Scan
+    ###################################################################
+    - name: Download Twistcli
+      run: |
+        curl -k \
+        -u "${{ secrets.PRISMA_ACCESS_KEY }}:${{ secrets.PRISMA_SECRET_KEY }}" \
+        https://${{ secrets.PRISMA_CONSOLE_URL }}/api/v1/util/twistcli \
+        --output twistcli
 
-      - name: Export Image URI
-        id: image
-        run: |
-          echo "image=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+        chmod +x twistcli
+
+    - name: Prisma Cloud Scan
+      run: |
+        ./twistcli images scan \
+          --address https://${{ secrets.PRISMA_CONSOLE_URL }} \
+          --user "${{ secrets.PRISMA_ACCESS_KEY }}" \
+          --password "${{ secrets.PRISMA_SECRET_KEY }}" \
+          connector:${{ github.sha }}
+
+    ###################################################################
+    # Tag and Push Image
+    ###################################################################
+    - name: Tag Docker Image
+      run: |
+        docker tag \
+        connector:${{ github.sha }} \
+        ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+    - name: Push Docker Image
+      run: |
+        docker push \
+        ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+    - name: Export Image URI
+      id: image
+      run: |
+        echo "image=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_OUTPUT
 
   package-lambda:
     name: Package Short Running Lambda Handlers
