@@ -1,0 +1,193 @@
+name: Connector CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+env:
+  AWS_REGION: us-east-1
+  ECR_REPOSITORY: connector-app
+  ECS_CLUSTER: prod-cluster
+  ECS_SERVICE: connector-service
+  ECS_TASK_DEFINITION: ecs-task-definition.json
+
+jobs:
+
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup NodeJS
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Validate Package Files
+        run: |
+          npm ci --dry-run
+
+  unit-tests:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    needs: validate
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Run Unit Tests
+        run: npm test -- --coverage
+
+  build-dependencies:
+    name: Build Connector Dependencies
+    runs-on: ubuntu-latest
+    needs: unit-tests
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: |
+          npm ci
+          npm run build
+
+  docker-build-scan-push:
+    name: Build Docker Image / Scan / Push
+    runs-on: ubuntu-latest
+    needs: build-dependencies
+
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build Docker Image from Dockerfile
+        run: |
+          docker build \
+            -f Dockerfile \
+            -t ${{ env.ECR_REPOSITORY }}:${{ github.sha }} .
+
+      - name: Scan Docker Image using Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.ECR_REPOSITORY }}:${{ github.sha }}"
+          format: table
+          exit-code: 1
+          severity: CRITICAL,HIGH
+
+      - name: Tag Docker Image
+        run: |
+          docker tag \
+          ${{ env.ECR_REPOSITORY }}:${{ github.sha }} \
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Push Docker Image to ECR
+        run: |
+          docker push \
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+
+      - name: Export Image URI
+        id: image
+        run: |
+          echo "image=${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}" >> $GITHUB_OUTPUT
+
+  package-lambda:
+    name: Package Short Running Lambda Handlers
+    runs-on: ubuntu-latest
+    needs: docker-build-scan-push
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Dependencies
+        run: npm ci
+
+      - name: Package Lambda
+        run: |
+          mkdir -p artifacts
+          zip -r artifacts/lambda-handler.zip lambda/
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: lambda-package
+          path: artifacts/lambda-handler.zip
+
+  deploy-ecs:
+    name: Deploy ECS Service
+    runs-on: ubuntu-latest
+    needs:
+      - docker-build-scan-push
+      - package-lambda
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Render ECS Task Definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: ${{ env.ECS_TASK_DEFINITION }}
+          container-name: app
+          image: ${{ needs.docker-build-scan-push.outputs.image }}
+
+      - name: Deploy ECS Service
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.task-def.outputs.task-definition }}
+          service: ${{ env.ECS_SERVICE }}
+          cluster: ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+  smoke-test:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    needs: deploy-ecs
+
+    steps:
+      - name: Verify Application Health
+        run: |
+          APP_URL=https://api.example.com/health
+
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" $APP_URL)
+
+          if [ "$STATUS" != "200" ]; then
+            echo "Smoke test failed."
+            exit 1
+          fi
+
+          echo "Smoke test passed."
